@@ -1,13 +1,24 @@
-# Easy Reverse Proxy 简化版
+# Easy Domain IP Port Proxy
 
-通用 Nginx 反代脚本。
+最简单的 Nginx 反代脚本。
 
-只需要输入两个东西：
+用户只需要输入三项：
 
-1. 对外入口：域名、服务器 IP 或 `_`
-2. 目标地址：端口、IP:端口 或完整 URL
+1. 域名
+2. 目标 IP
+3. 目标端口
+
+脚本会自动：
+
+- 安装 Nginx
+- 自动检测目标是 HTTP 还是 HTTPS
+- 配置 Nginx 反代
+- 自动申请 HTTPS 证书
+- 最后使用域名访问目标 IP:端口的网站
 
 ## 一键运行
+
+把 `你的GitHub用户名` 换成你的 GitHub 用户名：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/你的GitHub用户名/easy-reverse-proxy/main/install.sh)
@@ -15,44 +26,52 @@ bash <(curl -fsSL https://raw.githubusercontent.com/你的GitHub用户名/easy-r
 
 ## 输入示例
 
-### 目标是本机 9527
-
 ```text
-对外入口：_
-目标地址：9527
-目标是否使用 HTTPS？y
+请输入域名，例如 app.example.com: app.example.com
+请输入目标 IP，例如 127.0.0.1 或 1.2.3.4: 127.0.0.1
+请输入目标端口，例如 3000 或 9527: 9527
 ```
 
-脚本会自动理解成：
+最终访问：
 
 ```text
-https://127.0.0.1:9527/
+https://app.example.com
 ```
 
-### 目标是远程 IP:端口
+会反代到：
 
 ```text
-对外入口：proxy.example.com
-目标地址：20.80.16.38:9527
-目标是否使用 HTTPS？y
+127.0.0.1:9527
 ```
 
-### 目标是完整 URL
+脚本会自动判断目标是：
 
 ```text
-对外入口：app.example.com
-目标地址：https://127.0.0.1:9527/app/
+http://127.0.0.1:9527
 ```
 
-## 对外入口怎么填
+还是：
 
-- 有域名：填 `app.example.com`
-- 没有域名，只想用服务器 IP 访问：填 `_`
-- 也可以直接填服务器公网 IP
+```text
+https://127.0.0.1:9527
+```
 
-注意：Let's Encrypt 不能给普通 IP 签证书，所以入口是 IP 或 `_` 时会自动跳过 HTTPS 证书。
+## 运行前要求
 
-## 常见错误
+域名必须已经解析到当前 VPS 的公网 IP。
 
-不要把目标只填成 `9527` 的旧脚本版本会解析错。  
-本简化版已经修复：只填 `9527` 会自动当成 `127.0.0.1:9527`。
+云服务器安全组必须放行：
+
+```text
+TCP 80
+TCP 443
+```
+
+如果使用 Cloudflare，首次申请证书建议先设为 **仅 DNS/灰云**。
+
+## 删除配置
+
+```bash
+rm -f /etc/nginx/conf.d/easy-domain-ip-port-proxy.conf
+nginx -t && systemctl restart nginx
+```
