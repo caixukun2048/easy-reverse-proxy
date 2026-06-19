@@ -1,45 +1,48 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-C_RESET="\033[0m"
-C_BLUE="\033[1;34m"
-C_GREEN="\033[1;32m"
-C_YELLOW="\033[1;33m"
-C_RED="\033[1;31m"
+blue(){ echo -e "\033[1;34m[INFO]\033[0m $*"; }
+green(){ echo -e "\033[1;32m[OK]\033[0m $*"; }
+yellow(){ echo -e "\033[1;33m[WARN]\033[0m $*"; }
+red(){ echo -e "\033[1;31m[ERROR]\033[0m $*"; }
+die(){ red "$*"; exit 1; }
 
-info() { echo -e "${C_BLUE}[INFO]${C_RESET} $*"; }
-ok() { echo -e "${C_GREEN}[OK]${C_RESET} $*"; }
-warn() { echo -e "${C_YELLOW}[WARN]${C_RESET} $*"; }
-err() { echo -e "${C_RED}[ERROR]${C_RESET} $*"; }
-die() { err "$*"; exit 1; }
+[[ "$(id -u)" -eq 0 ]] || die "请用 root 运行：sudo bash install.sh"
 
-need_root() {
-  [[ "$(id -u)" -eq 0 ]] || die "请用 root 运行：sudo bash install.sh"
+is_ip(){
+  [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
 }
 
-trim_url_slash() {
+trim(){
   local s="$1"
   s="${s#"${s%%[![:space:]]*}"}"
   s="${s%"${s##*[![:space:]]}"}"
   echo "$s"
 }
 
-normalize_path() {
-  local p="$1"
-  [[ -n "$p" ]] || p="/"
+normalize_path(){
+  local p="${1:-/}"
   [[ "$p" == /* ]] || p="/$p"
   [[ "$p" == */ ]] || p="$p/"
   echo "$p"
 }
 
-parse_target() {
-  local raw="$1"
+parse_target(){
+  local raw
+  raw="$(trim "$1")"
+
   TARGET_SCHEME=""
   TARGET_HOST=""
   TARGET_PORT=""
   TARGET_PATH="/"
 
-  raw="$(trim_url_slash "$raw")"
+  # 只输入端口，例如 9527，则默认目标是本机 127.0.0.1:9527
+  if [[ "$raw" =~ ^[0-9]+$ ]]; then
+    TARGET_HOST="127.0.0.1"
+    TARGET_PORT="$raw"
+    TARGET_PATH="/"
+    return
+  fi
 
   if [[ "$raw" =~ ^https?:// ]]; then
     TARGET_SCHEME="$(echo "$raw" | sed -E 's#^(https?)://.*#\1#')"
@@ -49,8 +52,6 @@ parse_target() {
     if [[ "$rest" == */* ]]; then
       hostport="${rest%%/*}"
       TARGET_PATH="/${rest#*/}"
-    else
-      TARGET_PATH="/"
     fi
 
     if [[ "$hostport" == *:* ]]; then
@@ -61,14 +62,11 @@ parse_target() {
       [[ "$TARGET_SCHEME" == "https" ]] && TARGET_PORT="443" || TARGET_PORT="80"
     fi
   else
-    local rest="$raw"
-    local hostport="$rest"
+    local hostport="$raw"
 
-    if [[ "$rest" == */* ]]; then
-      hostport="${rest%%/*}"
-      TARGET_PATH="/${rest#*/}"
-    else
-      TARGET_PATH="/"
+    if [[ "$raw" == */* ]]; then
+      hostport="${raw%%/*}"
+      TARGET_PATH="/${raw#*/}"
     fi
 
     if [[ "$hostport" == *:* ]]; then
@@ -76,58 +74,42 @@ parse_target() {
       TARGET_PORT="${hostport##*:}"
     else
       TARGET_HOST="$hostport"
-      TARGET_PORT=""
     fi
   fi
 
   TARGET_PATH="$(normalize_path "$TARGET_PATH")"
 }
 
-install_pkgs() {
-  info "安装 Nginx、curl、证书工具..."
+install_packages(){
+  blue "安装 Nginx / curl / Certbot..."
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y nginx curl ca-certificates
-    if [[ "$ENABLE_HTTPS" == "y" ]]; then
-      DEBIAN_FRONTEND=noninteractive apt-get install -y certbot python3-certbot-nginx
-    fi
+    DEBIAN_FRONTEND=noninteractive apt-get install -y nginx curl ca-certificates certbot python3-certbot-nginx
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y nginx curl ca-certificates
-    if [[ "$ENABLE_HTTPS" == "y" ]]; then
-      dnf install -y certbot python3-certbot-nginx || dnf install -y certbot
-    fi
+    dnf install -y nginx curl ca-certificates certbot python3-certbot-nginx || dnf install -y nginx curl ca-certificates certbot
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y nginx curl ca-certificates
-    if [[ "$ENABLE_HTTPS" == "y" ]]; then
-      yum install -y certbot python3-certbot-nginx || yum install -y certbot
-    fi
+    yum install -y nginx curl ca-certificates certbot python3-certbot-nginx || yum install -y nginx curl ca-certificates certbot
   else
-    die "暂不支持当前系统包管理器。请使用 Ubuntu/Debian/CentOS/RHEL/Rocky/AlmaLinux。"
+    die "不支持当前系统包管理器，请使用 Ubuntu/Debian/CentOS/RHEL/Rocky/AlmaLinux"
   fi
 }
 
-is_ip_address() {
-  [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
-}
+write_nginx(){
+  local conf="/etc/nginx/conf.d/easy_reverse_proxy.conf"
+  local upstream="${TARGET_SCHEME}://${TARGET_HOST}:${TARGET_PORT}"
 
-safe_conf_name() {
-  echo "$1" | sed -E 's#https?://##; s#[/:]+#_#g; s#[^A-Za-z0-9_.-]#_#g'
-}
-
-write_nginx_conf() {
-  local conf_name
-  conf_name="$(safe_conf_name "${LISTEN_NAME}_${TARGET_HOST}_${TARGET_PORT}")"
-  NGINX_CONF="/etc/nginx/conf.d/reverse_${conf_name}.conf"
-
-  info "写入 Nginx 配置：$NGINX_CONF"
-
+  blue "清理旧的脚本配置..."
+  rm -f /etc/nginx/conf.d/easy_reverse_proxy.conf
+  rm -f /etc/nginx/conf.d/reverse_*.conf
   rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
 
-  if [[ -f "$NGINX_CONF" ]]; then
-    cp "$NGINX_CONF" "${NGINX_CONF}.bak.$(date +%Y%m%d%H%M%S)"
-  fi
+  local listen_line="listen 80;"
+  local server_name="$ENTRY"
 
-  local upstream_base="${TARGET_SCHEME}://${TARGET_HOST}:${TARGET_PORT}"
+  if [[ "$ENTRY" == "_" ]]; then
+    listen_line="listen 80 default_server;"
+    server_name="_"
+  fi
 
   local ssl_block=""
   if [[ "$TARGET_SCHEME" == "https" ]]; then
@@ -143,7 +125,7 @@ EOF_SSL
   fi
 
   local root_block=""
-  if [[ "$ROOT_REDIRECT" == "y" && "$TARGET_PATH" != "/" ]]; then
+  if [[ "$TARGET_PATH" != "/" ]]; then
     root_block=$(cat <<EOF_ROOT
     location = / {
         return 301 ${TARGET_PATH};
@@ -153,35 +135,19 @@ EOF_ROOT
 )
   fi
 
-  local host_header=""
-  case "$HOST_MODE" in
-    upstream)
-      host_header="${TARGET_HOST}:${TARGET_PORT}"
-      ;;
-    domain)
-      host_header="\$host"
-      ;;
-    custom)
-      host_header="${CUSTOM_HOST_HEADER}"
-      ;;
-    *)
-      host_header="${TARGET_HOST}:${TARGET_PORT}"
-      ;;
-  esac
-
-  cat > "$NGINX_CONF" <<EOF_NGINX
+  cat > "$conf" <<EOF_NGINX
 server {
-    listen 80;
-    server_name ${LISTEN_NAME};
+    ${listen_line}
+    server_name ${server_name};
 
-    client_max_body_size ${CLIENT_MAX_BODY_SIZE};
+    client_max_body_size 100m;
 
 ${root_block}    location / {
-        proxy_pass ${upstream_base};
+        proxy_pass ${upstream};
 
 ${ssl_block}        proxy_http_version 1.1;
 
-        proxy_set_header Host ${host_header};
+        proxy_set_header Host ${TARGET_HOST}:${TARGET_PORT};
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
@@ -201,180 +167,111 @@ EOF_NGINX
   nginx -t
   systemctl enable nginx >/dev/null 2>&1 || true
   systemctl restart nginx
-  ok "Nginx 已重启"
+  green "Nginx 配置完成：$conf"
 }
 
-open_ports() {
-  info "尝试放行 80/443 端口..."
+open_ports(){
   if command -v ufw >/dev/null 2>&1; then
+    blue "放行 UFW 80/443..."
     ufw allow 80 >/dev/null || true
     ufw allow 443 >/dev/null || true
     ufw reload >/dev/null || true
-    ok "UFW 已放行 80/443"
-  else
-    warn "未检测到 ufw，跳过系统防火墙配置。云服务器还需要在安全组放行 TCP 80/443。"
   fi
+  yellow "云服务器安全组也要放行 TCP 80 和 TCP 443。"
 }
 
-setup_cert() {
-  if [[ "$ENABLE_HTTPS" != "y" ]]; then
-    warn "已跳过 HTTPS。当前访问地址：http://${LISTEN_NAME}"
+setup_https(){
+  if [[ "$ENTRY" == "_" ]] || is_ip "$ENTRY"; then
+    yellow "入口是 IP 或 _，不能申请 Let's Encrypt 证书，已跳过 HTTPS。"
+    FINAL_URL="http://${ENTRY}"
+    [[ "$ENTRY" == "_" ]] && FINAL_URL="http://服务器IP"
     return
   fi
 
-  if [[ "$LISTEN_NAME" == "_" ]] || is_ip_address "$LISTEN_NAME"; then
-    warn "Let's Encrypt 不能给 '_' 或普通 IP 签发证书，跳过 HTTPS。"
-    warn "当前访问地址：http://${LISTEN_NAME}"
+  read -rp "检测到入口是域名，是否申请 HTTPS 证书？[Y/n]: " ans
+  ans="${ans:-Y}"
+  if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+    FINAL_URL="http://${ENTRY}"
     return
   fi
 
-  info "申请/安装 HTTPS 证书：${LISTEN_NAME}"
-  certbot --nginx -d "$LISTEN_NAME" --redirect || {
-    warn "证书申请失败。请确认域名已解析到当前服务器公网 IP，且安全组放行 80/443。"
+  blue "申请 HTTPS 证书：$ENTRY"
+  certbot --nginx -d "$ENTRY" --redirect || {
+    yellow "证书申请失败。请确认域名解析到当前 VPS，且 80/443 已放行。"
+    FINAL_URL="http://${ENTRY}"
     return
   }
 
   nginx -t
   systemctl restart nginx
-  ok "HTTPS 已配置"
+  FINAL_URL="https://${ENTRY}"
 }
 
-test_upstream() {
-  local target_url="${TARGET_SCHEME}://${TARGET_HOST}:${TARGET_PORT}${TARGET_PATH}"
+test_target(){
   local kopt=""
   [[ "$TARGET_SCHEME" == "https" ]] && kopt="-k"
+  local url="${TARGET_SCHEME}://${TARGET_HOST}:${TARGET_PORT}${TARGET_PATH}"
 
-  info "测试反代目标：$target_url"
+  blue "测试目标：$url"
   local code
-  code="$(curl $kopt -sS -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 12 "$target_url" || true)"
+  code="$(curl $kopt -sS -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 "$url" || true)"
   if [[ "$code" =~ ^(200|201|204|301|302|307|308|401|403)$ ]]; then
-    ok "目标有响应，HTTP 状态码：$code"
+    green "目标有响应：HTTP $code"
   else
-    warn "目标测试状态码：${code:-无法连接}"
-    warn "如果稍后 Nginx 返回 502，请检查目标 IP、端口、协议、防火墙。"
+    yellow "目标测试状态码：${code:-无法连接}。如果后面 502，请检查目标服务是否真的可访问。"
   fi
 }
 
-final_test() {
-  echo
-  info "最终测试："
-  curl -I --max-time 10 "http://${LISTEN_NAME}" || true
-  echo
+echo "=========================================="
+echo "        Easy Reverse Proxy 简化版"
+echo "=========================================="
+echo
+echo "只需要填两个东西："
+echo "1. 对外入口：你的域名、服务器 IP，或 _"
+echo "2. 目标地址：端口 / IP:端口 / 完整 URL"
+echo
+echo "目标只填 9527 时，自动理解为：127.0.0.1:9527"
+echo
 
-  if [[ "$ENABLE_HTTPS" == "y" && "$LISTEN_NAME" != "_" ]] && ! is_ip_address "$LISTEN_NAME"; then
-    curl -k -I --max-time 10 "https://${LISTEN_NAME}" || true
-    echo
-  fi
+read -rp "对外入口，例：app.example.com / 1.2.3.4 / _ : " ENTRY
+ENTRY="${ENTRY:-_}"
+ENTRY="$(echo "$ENTRY" | sed -E 's#^https?://##; s#/.*##; s#:.*##')"
 
-  ok "完成"
-  echo
-  echo "访问入口："
-  if [[ "$ENABLE_HTTPS" == "y" && "$LISTEN_NAME" != "_" ]] && ! is_ip_address "$LISTEN_NAME"; then
-    echo "  https://${LISTEN_NAME}"
-  else
-    echo "  http://${LISTEN_NAME}"
-  fi
-  echo
-  echo "反代目标："
-  echo "  ${TARGET_SCHEME}://${TARGET_HOST}:${TARGET_PORT}${TARGET_PATH}"
-  echo
-  echo "Nginx 配置文件："
-  echo "  $NGINX_CONF"
-}
+read -rp "目标地址，例：9527 / 127.0.0.1:9527 / 20.80.16.38:9527 / https://1.2.3.4:9527/app/ : " TARGET_RAW
+[[ -n "$TARGET_RAW" ]] || die "目标地址不能为空"
 
-main() {
-  need_root
+parse_target "$TARGET_RAW"
 
-  echo "=================================================="
-  echo "        通用 IP:端口 Nginx 反向代理脚本"
-  echo "=================================================="
-  echo
-  echo "它不绑定任何固定域名或固定项目。"
-  echo "你只需要输入："
-  echo "1. 对外访问的域名或服务器 IP"
-  echo "2. 要反代的目标 IP:端口，也可以是完整 URL"
-  echo
+if [[ -z "$TARGET_SCHEME" ]]; then
+  read -rp "目标是否使用 HTTPS？[y/N]: " scheme_ans
+  scheme_ans="${scheme_ans:-N}"
+  [[ "$scheme_ans" =~ ^[Yy]$ ]] && TARGET_SCHEME="https" || TARGET_SCHEME="http"
+fi
 
-  read -rp "对外访问域名/IP；没有域名可填 _，例如 app.example.com 或 _: " LISTEN_NAME
-  LISTEN_NAME="${LISTEN_NAME:-_}"
-  LISTEN_NAME="$(echo "$LISTEN_NAME" | sed -E 's#^https?://##; s#/.*##; s#:.*##')"
+if [[ -z "$TARGET_PORT" ]]; then
+  [[ "$TARGET_SCHEME" == "https" ]] && TARGET_PORT="443" || TARGET_PORT="80"
+fi
 
-  read -rp "要反代的目标，例如 127.0.0.1:3000 或 20.80.16.38:9527 或 https://1.2.3.4:8443/app/: " TARGET_RAW
-  [[ -n "$TARGET_RAW" ]] || die "目标不能为空"
+[[ -n "$TARGET_HOST" ]] || die "目标 Host 解析失败。请填写端口、IP:端口 或完整 URL。"
 
-  parse_target "$TARGET_RAW"
+echo
+blue "确认配置："
+echo "对外入口：$ENTRY"
+echo "反代目标：${TARGET_SCHEME}://${TARGET_HOST}:${TARGET_PORT}${TARGET_PATH}"
+echo
+read -rp "确认开始？[Y/n]: " go
+go="${go:-Y}"
+[[ "$go" =~ ^[Yy]$ ]] || die "已取消"
 
-  if [[ -z "$TARGET_SCHEME" ]]; then
-    read -rp "目标协议是 HTTPS 吗？[y/N]: " ans
-    ans="${ans:-N}"
-    if [[ "$ans" =~ ^[Yy]$ ]]; then
-      TARGET_SCHEME="https"
-    else
-      TARGET_SCHEME="http"
-    fi
-  fi
+install_packages
+test_target
+write_nginx
+open_ports
+setup_https
 
-  if [[ -z "$TARGET_PORT" ]]; then
-    if [[ "$TARGET_SCHEME" == "https" ]]; then
-      TARGET_PORT="443"
-    else
-      TARGET_PORT="80"
-    fi
-  fi
-
-  [[ -n "$TARGET_HOST" ]] || die "无法解析目标 IP/域名"
-
-  if [[ "$TARGET_PATH" != "/" ]]; then
-    read -rp "检测到目标路径 ${TARGET_PATH}。访问根路径 / 时是否自动跳到该路径？[Y/n]: " rr
-    rr="${rr:-Y}"
-    [[ "$rr" =~ ^[Yy]$ ]] && ROOT_REDIRECT="y" || ROOT_REDIRECT="n"
-  else
-    ROOT_REDIRECT="n"
-  fi
-
-  echo
-  echo "Host 头传递方式："
-  echo "1. 传目标 IP:端口，适合大多数 IP:端口反代"
-  echo "2. 传用户访问的域名，适合目标服务需要原域名"
-  echo "3. 自定义 Host"
-  read -rp "请选择 [1-3]，默认 1: " hm
-  hm="${hm:-1}"
-  case "$hm" in
-    1) HOST_MODE="upstream" ;;
-    2) HOST_MODE="domain" ;;
-    3)
-      HOST_MODE="custom"
-      read -rp "请输入自定义 Host，例如 20.80.16.38 或 app.internal:8080: " CUSTOM_HOST_HEADER
-      [[ -n "$CUSTOM_HOST_HEADER" ]] || die "自定义 Host 不能为空"
-      ;;
-    *) HOST_MODE="upstream" ;;
-  esac
-
-  read -rp "是否申请 HTTPS 证书？仅域名可用，IP 或 _ 不可用。[Y/n]: " eh
-  eh="${eh:-Y}"
-  [[ "$eh" =~ ^[Yy]$ ]] && ENABLE_HTTPS="y" || ENABLE_HTTPS="n"
-
-  read -rp "上传大小限制，默认 100m: " CLIENT_MAX_BODY_SIZE
-  CLIENT_MAX_BODY_SIZE="${CLIENT_MAX_BODY_SIZE:-100m}"
-
-  echo
-  info "确认配置："
-  echo "对外入口：${LISTEN_NAME}"
-  echo "反代目标：${TARGET_SCHEME}://${TARGET_HOST}:${TARGET_PORT}${TARGET_PATH}"
-  echo "根路径跳转：${ROOT_REDIRECT}"
-  echo "Host 模式：${HOST_MODE}"
-  echo "申请 HTTPS：${ENABLE_HTTPS}"
-  echo
-  read -rp "确认执行？[Y/n]: " go
-  go="${go:-Y}"
-  [[ "$go" =~ ^[Yy]$ ]] || die "已取消"
-
-  install_pkgs
-  test_upstream
-  write_nginx_conf
-  open_ports
-  setup_cert
-  final_test
-}
-
-main "$@"
+echo
+green "完成。"
+echo "访问入口：$FINAL_URL"
+if [[ "$TARGET_PATH" != "/" ]]; then
+  echo "路径入口：$FINAL_URL$TARGET_PATH"
+fi
