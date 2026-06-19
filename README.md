@@ -74,20 +74,20 @@ https://proxy.example.com
 ## 示例 3：反代完整 URL 和路径
 
 ```text
-对外访问域名/IP：serv0.nyc.mn
+对外访问域名/IP：app.example.com
 反代目标：https://127.0.0.1:9527/radiance-bot-client/
 ```
 
 最终访问：
 
 ```text
-https://serv0.nyc.mn
+https://app.example.com
 ```
 
 会自动跳转到：
 
 ```text
-https://serv0.nyc.mn/radiance-bot-client/
+https://app.example.com/radiance-bot-client/
 ```
 
 ## Host 头模式
