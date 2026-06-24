@@ -1,165 +1,420 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# 确保脚本以 root 权限运行
-if [ "$EUID" -ne 0 ]; then
-    echo "❌ 请使用 root 用户或 sudo 运行此脚本！"
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+PROJECT_NAME="easy-reverse-proxy"
+WEBROOT="/var/www/letsencrypt"
+MAP_FILE="/etc/nginx/conf.d/00-easy-reverse-proxy-map.conf"
+CRON_FILE="/etc/cron.d/easy-reverse-proxy-certbot"
+
+trap 'echo "❌ 脚本执行失败，失败位置：第 ${LINENO} 行。请查看上方错误信息。"' ERR
+
+error_exit() {
+    echo "❌ $1"
     exit 1
-fi
+}
 
-echo "=========================================="
-echo "    欢迎使用万能反向代理一键脚本 (V2.2)"
-echo "    完全精简交互 | 完美适配所有协议与路由"
-echo "=========================================="
-echo ""
+info() {
+    echo "🔄 $1"
+}
 
-# ==========================================
-# 1. 极简交互输入（已删除所有“例如”提示文字）
-# ==========================================
-read -p "1. 请输入你的反代域名: " DOMAIN
-if [ -z "$DOMAIN" ]; then
-    echo "❌ 域名不能为空！"
-    exit 1
-fi
+success() {
+    echo "✅ $1"
+}
 
-read -p "2. 请输入目标源站 IP: " TARGET_IP
-if [ -z "$TARGET_IP" ]; then
-    echo "❌ 目标 IP 不能为空！"
-    exit 1
-fi
+require_root() {
+    if [ "${EUID}" -ne 0 ]; then
+        error_exit "请使用 root 用户或 sudo 运行此脚本！"
+    fi
+}
 
-read -p "3. 请输入目标源站端口: " TARGET_PORT
-if [ -z "$TARGET_PORT" ]; then
-    echo "❌ 目标端口不能为空！"
-    exit 1
-fi
+require_supported_os() {
+    if ! command -v apt-get >/dev/null 2>&1; then
+        error_exit "当前脚本仅支持 Debian / Ubuntu 系统。"
+    fi
 
-read -p "4. 请输入你的电子邮箱: " EMAIL
-if [ -z "$EMAIL" ]; then
-    echo "❌ 邮箱不能为空！"
-    exit 1
-fi
+    if ! command -v systemctl >/dev/null 2>&1; then
+        error_exit "未检测到 systemctl，当前系统环境不受支持。"
+    fi
+}
 
-# 后台自动拼接标准的源站 URL
-TARGET_URL="http://${TARGET_IP}:${TARGET_PORT}"
+trim() {
+    local value="$*"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
 
-echo ""
-echo "------------------------------------------"
-echo " 准备配置: https://${DOMAIN} -> ${TARGET_URL}"
-echo "------------------------------------------"
-echo ""
+normalize_domain() {
+    local domain
+    domain="$(trim "$1")"
+    domain="${domain#http://}"
+    domain="${domain#https://}"
+    domain="${domain%%/*}"
+    domain="${domain,,}"
+    printf '%s' "$domain"
+}
 
-# ==========================================
-# 2. 安装基础环境 (Nginx & Certbot)
-# ==========================================
-echo "🔄 正在更新系统并安装 Nginx 和 Certbot..."
-apt-get update -y
-apt-get install -y nginx certbot python3-certbot-nginx curl
+validate_domain() {
+    local domain="$1"
 
-# 确保 Nginx 处于运行并开机自启状态
-systemctl start nginx
-systemctl enable nginx
+    if [ -z "$domain" ]; then
+        error_exit "域名不能为空！"
+    fi
 
-# ==========================================
-# 3. 步骤一：先写入临时 80 端口配置（破解证书申请死锁）
-# ==========================================
-echo "🔄 正在生成临时验证配置..."
-cat <<EOF > /etc/nginx/conf.d/easy-reverse-proxy.conf
+    if [ "${#domain}" -gt 253 ]; then
+        error_exit "域名长度不能超过 253 个字符！"
+    fi
+
+    if ! [[ "$domain" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9-]{2,63}$ ]]; then
+        error_exit "域名格式不合法！请输入类似 example.com 的完整域名。"
+    fi
+}
+
+validate_target_host() {
+    local target_host="$1"
+
+    if [ -z "$target_host" ]; then
+        error_exit "目标源站 IP 不能为空！"
+    fi
+
+    # 允许 IPv4、IPv6、内网主机名、普通域名；禁止空格、分号、括号等可能破坏 Nginx 配置的字符。
+    if ! [[ "$target_host" =~ ^[A-Za-z0-9._:-]+$ ]]; then
+        error_exit "目标源站 IP / 主机格式不合法！"
+    fi
+}
+
+validate_port() {
+    local port="$1"
+
+    if [ -z "$port" ]; then
+        error_exit "目标端口不能为空！"
+    fi
+
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        error_exit "端口必须是 1-65535 的数字！"
+    fi
+}
+
+validate_email() {
+    local email="$1"
+
+    if [ -z "$email" ]; then
+        error_exit "邮箱不能为空！"
+    fi
+
+    if ! [[ "$email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
+        error_exit "邮箱格式不合法！"
+    fi
+}
+
+format_target_host_for_url() {
+    local target_host="$1"
+
+    # IPv6 地址在 URL 中必须写成 [IPv6]:端口
+    if [[ "$target_host" == *:* ]] && [[ "$target_host" != \[*\] ]]; then
+        printf '[%s]' "$target_host"
+    else
+        printf '%s' "$target_host"
+    fi
+}
+
+detect_target_scheme() {
+    local host_for_url="$1"
+    local port="$2"
+    local https_code
+    local http_code
+
+    info "正在自动探测源站协议..."
+
+    https_code="$(curl -k -s -o /dev/null -w "%{http_code}" --connect-timeout 4 --max-time 8 "https://${host_for_url}:${port}/" || true)"
+    http_code="$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 4 --max-time 8 "http://${host_for_url}:${port}/" || true)"
+
+    [ -z "$https_code" ] && https_code="000"
+    [ -z "$http_code" ] && http_code="000"
+
+    if [ "$https_code" != "000" ]; then
+        printf 'https'
+    elif [ "$http_code" != "000" ]; then
+        printf 'http'
+    else
+        echo "⚠️ 未能自动探测源站协议，默认使用 HTTP。" >&2
+        printf 'http'
+    fi
+}
+
+install_dependencies() {
+    info "正在安装 Nginx、Certbot、curl..."
+
+    export DEBIAN_FRONTEND=noninteractive
+
+    apt-get update -y
+    apt-get install -y nginx certbot curl ca-certificates
+
+    systemctl enable nginx
+    systemctl start nginx
+}
+
+create_common_map_config() {
+    cat > "$MAP_FILE" <<'EOF'
+# Managed by easy-reverse-proxy.
+# WebSocket upgrade helper.
+map $http_upgrade $erp_connection_upgrade {
+    default upgrade;
+    '' close;
+}
+EOF
+}
+
+write_temp_nginx_config() {
+    local domain="$1"
+    local config_file="$2"
+
+    mkdir -p "$WEBROOT"
+
+    cat > "$config_file" <<EOF
+# Managed by easy-reverse-proxy.
+# Temporary config for Let's Encrypt HTTP-01 verification.
+
 server {
     listen 80;
-    server_name $DOMAIN;
+    server_name ${domain};
+
+    location ^~ /.well-known/acme-challenge/ {
+        root ${WEBROOT};
+        default_type "text/plain";
+        try_files \$uri =404;
+    }
+
     location / {
-        root /var/www/html;
+        return 200 "easy-reverse-proxy: SSL verification is ready.\n";
+        add_header Content-Type text/plain;
     }
 }
 EOF
+}
 
-# 重启 Nginx 使临时验证配置生效
-systemctl restart nginx
+request_certificate() {
+    local domain="$1"
+    local email="$2"
 
-# ==========================================
-# 4. 步骤二：自动化申请 SSL 证书
-# ==========================================
-echo "🔄 正在通过 Certbot 申请 SSL 证书..."
-certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
+    info "正在申请 SSL 证书..."
 
-if [ $? -ne 0 ]; then
-    echo "❌ SSL 证书申请失败！请检查域名解析是否生效，且 80 端口未被其他服务占用。"
-    exit 1
-fi
+    certbot certonly \
+        --webroot \
+        -w "$WEBROOT" \
+        -d "$domain" \
+        --non-interactive \
+        --agree-tos \
+        --keep-until-expiring \
+        -m "$email"
+}
 
-# ==========================================
-# 5. 步骤三：证书获取成功，覆盖写入万能盲反代 Nginx 配置
-# ==========================================
-echo "🔄 证书申请成功！正在生成最终的万能反代配置..."
+write_final_nginx_config() {
+    local domain="$1"
+    local target_url="$2"
+    local config_file="$3"
 
-cat <<EOF > /etc/nginx/conf.d/easy-reverse-proxy.conf
+    local ssl_options_line=""
+    local ssl_dhparam_line=""
+
+    if [ -f /etc/letsencrypt/options-ssl-nginx.conf ]; then
+        ssl_options_line="    include /etc/letsencrypt/options-ssl-nginx.conf;"
+    fi
+
+    if [ -f /etc/letsencrypt/ssl-dhparams.pem ]; then
+        ssl_dhparam_line="    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;"
+    fi
+
+    cat > "$config_file" <<EOF
+# Managed by easy-reverse-proxy.
+# Domain: ${domain}
+# Upstream: ${target_url}
+
 server {
     listen 80;
-    server_name $DOMAIN;
-    
-    # 强制将所有普通的 HTTP 请求重定向到 HTTPS
-    return 301 https://\$host\$request_uri;
+    server_name ${domain};
+
+    location ^~ /.well-known/acme-challenge/ {
+        root ${WEBROOT};
+        default_type "text/plain";
+        try_files \$uri =404;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
 }
 
 server {
     listen 443 ssl;
-    server_name $DOMAIN;
+    server_name ${domain};
 
-    client_max_body_size 0; # 解除上传大小限制，通吃所有大文件/网盘服务
+    ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
+${ssl_options_line}
+${ssl_dhparam_line}
+
+    client_max_body_size 0;
     chunked_transfer_encoding on;
 
-    # 万能反代黑洞：捕获任意路径（完美解决二级目录跳转、单页应用留白问题）
     location / {
-        # 1. 透传核心请求头，让后端无缝识别域名，防止跨域拒绝连接
+        proxy_pass ${target_url};
+
+        proxy_http_version 1.1;
+
+        # Forward original visitor and public HTTPS information to upstream.
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Proto https;
         proxy_set_header X-Forwarded-Host \$host;
-        proxy_set_header X-Forwarded-Port \$server_port;
+        proxy_set_header X-Forwarded-Port 443;
+        proxy_set_header X-Forwarded-Ssl on;
 
-        # 2. 强行将所有浏览器路径 (\$request_uri) 拼接到后端，透明传输所有跳转
-        proxy_pass $TARGET_URL\$request_uri;
-        
-        # 3. 三重拦截修正：防止后端项目登录后重定向到它的内网 IP+端口
-        proxy_redirect $TARGET_URL/ /;
-        proxy_redirect $TARGET_URL http://\$host/;
-        proxy_redirect http://$TARGET_URL/ /;
-
-        # 4. 默认开启万能 WebSocket 支持（对普通 HTTP 无害，完美兼容机器人/聊天面板）
-        proxy_http_version 1.1;
+        # WebSocket support.
         proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Connection \$erp_connection_upgrade;
 
-        # 5. 关闭缓存，开启流式传输（对 ChatGPT 蹦字、实时控制台极其重要）
+        # Rewrite upstream absolute redirects back to the public domain.
+        proxy_redirect ${target_url}/ https://\$host/;
+        proxy_redirect ${target_url} https://\$host;
+
+        # Keep large upload and streaming scenarios stable.
         proxy_buffering off;
+        proxy_request_buffering off;
+
         proxy_connect_timeout 60s;
         proxy_send_timeout 3600s;
         proxy_read_timeout 3600s;
-    }
 
-    # SSL 证书路径绑定
-    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem; 
-    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
+        # Allow HTTPS upstreams with self-signed or IP certificates.
+        proxy_ssl_server_name on;
+        proxy_ssl_verify off;
+    }
 }
 EOF
+}
 
-# 自动引入 Certbot 推荐的安全加密配置（如果存在的话）
-if [ -f /etc/letsencrypt/options-ssl-nginx.conf ]; then
-    sed -i '/ssl_certificate_key/a \    include /etc/letsencrypt/options-ssl-nginx.conf;\n    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;' /etc/nginx/conf.d/easy-reverse-proxy.conf
-fi
+install_renew_cron() {
+    cat > "$CRON_FILE" <<'EOF'
+# Managed by easy-reverse-proxy.
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-# 配置自动续期定时任务（每隔2天在午夜自动检查并续期）
-echo "0 0 */2 * * certbot renew --post-hook 'systemctl reload nginx'" | crontab -
+0 3 * * * root certbot renew --quiet --deploy-hook "systemctl reload nginx"
+EOF
 
-# ==========================================
-# 6. 重启服务使配置生效
-# ==========================================
-echo "🔄 正在重启 Nginx 使万能反代生效..."
-nginx -t && systemctl restart nginx
+    chmod 644 "$CRON_FILE"
+}
 
-echo ""
-echo "=========================================="
-echo "🎉 万能反向代理项目配置成功！"
-echo "访问地址: https://${DOMAIN}"
-echo "=========================================="
+print_banner() {
+    echo "=========================================="
+    echo "    easy-reverse-proxy"
+    echo "    通用网站反向代理一键脚本"
+    echo "=========================================="
+    echo ""
+    echo "支持：HTTP / HTTPS / WebSocket 网站服务"
+    echo "不支持：SSH、数据库、UDP、游戏服等非 HTTP 服务"
+    echo ""
+}
+
+main() {
+    require_root
+    require_supported_os
+    print_banner
+
+    read -r -p "1. 请输入你的反代域名: " DOMAIN_INPUT
+    read -r -p "2. 请输入目标源站 IP: " TARGET_HOST_INPUT
+    read -r -p "3. 请输入目标源站端口: " TARGET_PORT_INPUT
+    read -r -p "4. 请输入你的电子邮箱: " EMAIL_INPUT
+
+    DOMAIN="$(normalize_domain "$DOMAIN_INPUT")"
+    TARGET_HOST="$(trim "$TARGET_HOST_INPUT")"
+    TARGET_PORT="$(trim "$TARGET_PORT_INPUT")"
+    EMAIL="$(trim "$EMAIL_INPUT")"
+
+    validate_domain "$DOMAIN"
+    validate_target_host "$TARGET_HOST"
+    validate_port "$TARGET_PORT"
+    validate_email "$EMAIL"
+
+    TARGET_HOST_FOR_URL="$(format_target_host_for_url "$TARGET_HOST")"
+    TARGET_SCHEME="$(detect_target_scheme "$TARGET_HOST_FOR_URL" "$TARGET_PORT")"
+    TARGET_URL="${TARGET_SCHEME}://${TARGET_HOST_FOR_URL}:${TARGET_PORT}"
+
+    CONFIG_FILE="/etc/nginx/conf.d/easy-reverse-proxy-${DOMAIN}.conf"
+    BACKUP_FILE="${CONFIG_FILE}.bak.$(date +%s)"
+
+    echo ""
+    echo "------------------------------------------"
+    echo " 准备配置:"
+    echo " https://${DOMAIN}  ->  ${TARGET_URL}"
+    echo "------------------------------------------"
+    echo ""
+
+    install_dependencies
+
+    if [ -f "$CONFIG_FILE" ]; then
+        cp "$CONFIG_FILE" "$BACKUP_FILE"
+        success "已备份旧配置: $BACKUP_FILE"
+    fi
+
+    create_common_map_config
+
+    info "正在生成 Let's Encrypt 验证配置..."
+    write_temp_nginx_config "$DOMAIN" "$CONFIG_FILE"
+
+    nginx -t
+    systemctl reload nginx
+
+    if ! request_certificate "$DOMAIN" "$EMAIL"; then
+        echo "❌ SSL 证书申请失败！"
+        echo "请检查："
+        echo "1. 域名 A/AAAA 记录是否已经解析到当前服务器"
+        echo "2. 当前服务器的 80 端口是否已开放"
+        echo "3. 云服务器安全组、防火墙、CDN 是否阻挡了 HTTP-01 验证"
+        echo "4. 同一个域名是否短时间内重复申请导致 Let's Encrypt 限制"
+
+        if [ -f "$BACKUP_FILE" ]; then
+            cp "$BACKUP_FILE" "$CONFIG_FILE"
+            nginx -t && systemctl reload nginx
+            success "已恢复旧配置。"
+        fi
+
+        exit 1
+    fi
+
+    info "正在生成最终反向代理配置..."
+    write_final_nginx_config "$DOMAIN" "$TARGET_URL" "$CONFIG_FILE"
+
+    info "正在检查 Nginx 配置..."
+    if nginx -t; then
+        systemctl reload nginx
+    else
+        echo "❌ Nginx 配置测试失败！"
+
+        if [ -f "$BACKUP_FILE" ]; then
+            cp "$BACKUP_FILE" "$CONFIG_FILE"
+            nginx -t && systemctl reload nginx
+            success "已恢复旧配置。"
+        fi
+
+        exit 1
+    fi
+
+    install_renew_cron
+
+    echo ""
+    echo "=========================================="
+    echo "🎉 反向代理配置成功！"
+    echo "访问地址: https://${DOMAIN}"
+    echo "源站地址: ${TARGET_URL}"
+    echo "配置文件: ${CONFIG_FILE}"
+    echo "=========================================="
+    echo ""
+    echo "提示：如访问异常，请先确认源站服务本身可从本服务器访问。"
+}
+
+main "$@"
