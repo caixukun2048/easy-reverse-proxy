@@ -7,39 +7,39 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=========================================="
-echo "    欢迎使用万能反向代理一键脚本 (V2.0)"
-echo "    支持任意 IP+端口、单页应用与 WebSocket"
+echo "    欢迎使用万能反向代理一键脚本 (V2.2)"
+echo "    完全精简交互 | 完美适配所有协议与路由"
 echo "=========================================="
 echo ""
 
 # ==========================================
-# 1. 极简交互输入
+# 1. 极简交互输入（已删除所有“例如”提示文字）
 # ==========================================
-read -p "1. 请输入你的反代域名 (例如 serv0.nyc.mn): " DOMAIN
+read -p "1. 请输入你的反代域名: " DOMAIN
 if [ -z "$DOMAIN" ]; then
     echo "❌ 域名不能为空！"
     exit 1
 fi
 
-read -p "2. 请输入目标源站 IP (例如 34.92.88.68): " TARGET_IP
+read -p "2. 请输入目标源站 IP: " TARGET_IP
 if [ -z "$TARGET_IP" ]; then
     echo "❌ 目标 IP 不能为空！"
     exit 1
 fi
 
-read -p "3. 请输入目标源站端口 (例如 8818): " TARGET_PORT
+read -p "3. 请输入目标源站端口: " TARGET_PORT
 if [ -z "$TARGET_PORT" ]; then
     echo "❌ 目标端口不能为空！"
     exit 1
 fi
 
-read -p "4. 请输入你的电子邮箱 (用于接收证书过期提醒): " EMAIL
+read -p "4. 请输入你的电子邮箱: " EMAIL
 if [ -z "$EMAIL" ]; then
     echo "❌ 邮箱不能为空！"
     exit 1
 fi
 
-# 后台自动拼接成标准的后端 URL 格式
+# 后台自动拼接标准的源站 URL
 TARGET_URL="http://${TARGET_IP}:${TARGET_PORT}"
 
 echo ""
@@ -55,14 +55,42 @@ echo "🔄 正在更新系统并安装 Nginx 和 Certbot..."
 apt-get update -y
 apt-get install -y nginx certbot python3-certbot-nginx curl
 
-# 启动并开机自启 Nginx
+# 确保 Nginx 处于运行并开机自启状态
 systemctl start nginx
 systemctl enable nginx
 
 # ==========================================
-# 3. 写入万能盲反代 Nginx 配置
+# 3. 步骤一：先写入临时 80 端口配置（破解证书申请死锁）
 # ==========================================
-echo "🔄 正在生成万能反代 Nginx 配置文件..."
+echo "🔄 正在生成临时验证配置..."
+cat <<EOF > /etc/nginx/conf.d/easy-reverse-proxy.conf
+server {
+    listen 80;
+    server_name $DOMAIN;
+    location / {
+        root /var/www/html;
+    }
+}
+EOF
+
+# 重启 Nginx 使临时验证配置生效
+systemctl restart nginx
+
+# ==========================================
+# 4. 步骤二：自动化申请 SSL 证书
+# ==========================================
+echo "🔄 正在通过 Certbot 申请 SSL 证书..."
+certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
+
+if [ $? -ne 0 ]; then
+    echo "❌ SSL 证书申请失败！请检查域名解析是否生效，且 80 端口未被其他服务占用。"
+    exit 1
+fi
+
+# ==========================================
+# 5. 步骤三：证书获取成功，覆盖写入万能盲反代 Nginx 配置
+# ==========================================
+echo "🔄 证书申请成功！正在生成最终的万能反代配置..."
 
 cat <<EOF > /etc/nginx/conf.d/easy-reverse-proxy.conf
 server {
@@ -110,38 +138,22 @@ server {
         proxy_read_timeout 3600s;
     }
 
-    # 以下证书路径供 Certbot 自动挂载管理
+    # SSL 证书路径绑定
     ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem; 
     ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
 }
 EOF
 
-# ==========================================
-# 4. 自动化申请 SSL 证书
-# ==========================================
-echo "🔄 正在通过 Certbot 申请并配置 SSL 证书..."
-
-# 先生成临时配置让 Certbot 能够验证域名
-nginx -t && systemctl reload nginx
-
-# 自动化非交互式申请证书
-certbot certonly --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL"
-
-if [ $? -ne 0 ]; then
-    echo "❌ SSL 证书申请失败，请检查域名解析是否已经生效，且 80/443 端口未被占用！"
-    exit 1
-fi
-
-# 引入 Certbot 推荐的安全配置
+# 自动引入 Certbot 推荐的安全加密配置（如果存在的话）
 if [ -f /etc/letsencrypt/options-ssl-nginx.conf ]; then
     sed -i '/ssl_certificate_key/a \    include /etc/letsencrypt/options-ssl-nginx.conf;\n    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;' /etc/nginx/conf.d/easy-reverse-proxy.conf
 fi
 
-# 配置 Certbot 自动续期定时任务
+# 配置自动续期定时任务（每隔2天在午夜自动检查并续期）
 echo "0 0 */2 * * certbot renew --post-hook 'systemctl reload nginx'" | crontab -
 
 # ==========================================
-# 5. 重启服务并完成
+# 6. 重启服务使配置生效
 # ==========================================
 echo "🔄 正在重启 Nginx 使万能反代生效..."
 nginx -t && systemctl restart nginx
@@ -150,8 +162,4 @@ echo ""
 echo "=========================================="
 echo "🎉 万能反向代理项目配置成功！"
 echo "访问地址: https://${DOMAIN}"
-echo "------------------------------------------"
-echo "💡 提示：如果依然打不开，请务必确认："
-echo "   1. 云服务器安全组放行了 TCP 80 和 443"
-echo "   2. 目标源站 ${TARGET_IP} 的 ${TARGET_PORT} 端口没有被防火墙拦截"
 echo "=========================================="
