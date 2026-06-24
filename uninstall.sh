@@ -59,12 +59,18 @@ main() {
     validate_domain "$DOMAIN"
 
     CONFIG_FILE="/etc/nginx/conf.d/easy-reverse-proxy-${DOMAIN}.conf"
+    LEGACY_CONFIG_FILE="/etc/nginx/conf.d/easy-reverse-proxy.conf"
 
     if [ -f "$CONFIG_FILE" ]; then
         rm -f "$CONFIG_FILE"
         echo "✅ 已删除 Nginx 配置: $CONFIG_FILE"
     else
         echo "⚠️ 未找到该域名的 Nginx 配置: $CONFIG_FILE"
+    fi
+
+    if [ -f "$LEGACY_CONFIG_FILE" ] && grep -q "$DOMAIN" "$LEGACY_CONFIG_FILE" 2>/dev/null; then
+        rm -f "$LEGACY_CONFIG_FILE"
+        echo "✅ 已删除旧版 Nginx 配置: $LEGACY_CONFIG_FILE"
     fi
 
     read -r -p "是否同时删除该域名的 SSL 证书？[y/N]: " DELETE_CERT

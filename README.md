@@ -1,6 +1,6 @@
 # easy-reverse-proxy
 
-一个适合上传到 GitHub 的通用网站反向代理一键脚本。
+通用网站反向代理一键脚本。
 
 用户只需要输入：
 
@@ -18,6 +18,43 @@
 - 自动启用 WebSocket 支持
 - 自动配置证书续期任务
 - 支持多次运行，为不同域名添加多个反代配置
+- 自动禁用旧版 easy-reverse-proxy 异常配置，避免缺失证书导致 nginx -t 失败
+
+---
+
+## 一键安装
+
+推荐使用：
+
+```bash
+curl -fsSL -o /tmp/easy-reverse-proxy-install.sh https://raw.githubusercontent.com/caixukun2048/easy-reverse-proxy/main/install.sh && sudo bash /tmp/easy-reverse-proxy-install.sh
+```
+
+或者：
+
+```bash
+git clone https://github.com/caixukun2048/easy-reverse-proxy.git
+cd easy-reverse-proxy
+chmod +x install.sh uninstall.sh
+sudo ./install.sh
+```
+
+---
+
+## 使用时输入
+
+```text
+1. 请输入你的反代域名: proxy.example.com
+2. 请输入目标源站 IP: 1.2.3.4
+3. 请输入目标源站端口: 8080
+4. 请输入你的电子邮箱: admin@example.com
+```
+
+完成后访问：
+
+```text
+https://proxy.example.com
+```
 
 ---
 
@@ -64,32 +101,6 @@
 
 ---
 
-## 快速使用
-
-```bash
-git clone https://github.com/你的用户名/easy-reverse-proxy.git
-cd easy-reverse-proxy
-chmod +x install.sh uninstall.sh
-sudo ./install.sh
-```
-
-然后根据提示输入：
-
-```text
-1. 请输入你的反代域名: proxy.example.com
-2. 请输入目标源站 IP: 1.2.3.4
-3. 请输入目标源站端口: 8080
-4. 请输入你的电子邮箱: admin@example.com
-```
-
-配置完成后访问：
-
-```text
-https://proxy.example.com
-```
-
----
-
 ## 示例
 
 假设你的源站服务是：
@@ -104,7 +115,7 @@ http://1.2.3.4:8080
 https://proxy.example.com
 ```
 
-那么运行脚本后输入：
+运行脚本后输入：
 
 ```text
 反代域名：proxy.example.com
@@ -158,6 +169,12 @@ c.example.com -> 10.0.0.2:3000
 ## 卸载某个域名的反代配置
 
 ```bash
+curl -fsSL -o /tmp/easy-reverse-proxy-uninstall.sh https://raw.githubusercontent.com/caixukun2048/easy-reverse-proxy/main/uninstall.sh && sudo bash /tmp/easy-reverse-proxy-uninstall.sh
+```
+
+或者：
+
+```bash
 sudo ./uninstall.sh
 ```
 
@@ -184,6 +201,33 @@ sudo ./uninstall.sh
 - `easy-reverse-proxy-你的域名.conf`：具体域名的反代配置
 - `easy-reverse-proxy-certbot`：证书自动续期任务
 - `/var/www/letsencrypt`：Let's Encrypt HTTP-01 验证目录
+
+---
+
+## 当前报错修复
+
+如果出现类似：
+
+```text
+cannot load certificate "/etc/letsencrypt/live/xxx/fullchain.pem"
+```
+
+说明 Nginx 中存在旧的坏配置，引用了已经不存在的 SSL 证书。
+
+可以执行：
+
+```bash
+grep -R "letsencrypt/live" /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null
+```
+
+找到对应配置后，将其禁用：
+
+```bash
+mv /etc/nginx/conf.d/对应配置.conf /etc/nginx/conf.d/对应配置.conf.disabled
+nginx -t && systemctl reload nginx
+```
+
+新版安装脚本会自动禁用本项目旧版异常配置。
 
 ---
 
@@ -293,30 +337,6 @@ sudo ufw allow 80/tcp
 sudo ufw allow 443/tcp
 sudo ufw reload
 ```
-
----
-
-## 手动更新项目
-
-```bash
-git pull
-chmod +x install.sh uninstall.sh
-sudo ./install.sh
-```
-
----
-
-## 安全说明
-
-本脚本会：
-
-- 安装 Nginx、Certbot、curl
-- 写入 `/etc/nginx/conf.d/` 配置
-- 写入 `/etc/cron.d/` 证书续期任务
-- 使用 Let's Encrypt 申请 SSL 证书
-- 重载 Nginx 服务
-
-请在可信服务器上运行。
 
 ---
 

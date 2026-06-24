@@ -23,6 +23,10 @@ success() {
     echo "✅ $1"
 }
 
+warn() {
+    echo "⚠️ $1"
+}
+
 require_root() {
     if [ "${EUID}" -ne 0 ]; then
         error_exit "请使用 root 用户或 sudo 运行此脚本！"
@@ -154,6 +158,89 @@ install_dependencies() {
 
     systemctl enable nginx
     systemctl start nginx
+}
+
+disable_file_safely() {
+    local file="$1"
+    local disabled_file="${file}.disabled.$(date +%s)"
+
+    mv "$file" "$disabled_file"
+    warn "已禁用旧的异常配置: $file -> $disabled_file"
+}
+
+is_managed_or_legacy_erp_config() {
+    local file="$1"
+    local base
+    base="$(basename "$file")"
+
+    case "$base" in
+        easy-reverse-proxy.conf|easy-reverse-proxy-*.conf)
+            return 0
+            ;;
+    esac
+
+    if grep -qE "Managed by easy-reverse-proxy|easy-reverse-proxy|万能反向代理|通用网站反向代理" "$file" 2>/dev/null; then
+        return 0
+    fi
+
+    return 1
+}
+
+has_missing_certificate_reference() {
+    local file="$1"
+    local cert_path
+
+    while read -r cert_path; do
+        cert_path="${cert_path%;}"
+        cert_path="$(printf '%s' "$cert_path" | tr -d '"'\''')"
+
+        if [ -n "$cert_path" ] && [[ "$cert_path" == /* ]] && [ ! -f "$cert_path" ]; then
+            return 0
+        fi
+    done < <(awk '$1 == "ssl_certificate" || $1 == "ssl_certificate_key" {print $2}' "$file" 2>/dev/null)
+
+    return 1
+}
+
+cleanup_legacy_easy_reverse_proxy_configs() {
+    local current_config_file="$1"
+    local file
+
+    info "正在检查旧版 easy-reverse-proxy 配置..."
+
+    shopt -s nullglob
+
+    for file in \
+        /etc/nginx/conf.d/easy-reverse-proxy.conf \
+        /etc/nginx/conf.d/easy-reverse-proxy-*.conf \
+        /etc/nginx/sites-enabled/easy-reverse-proxy.conf \
+        /etc/nginx/sites-enabled/easy-reverse-proxy-*.conf
+    do
+        [ -f "$file" ] || continue
+
+        # 当前即将写入的配置文件不处理。
+        if [ "$file" = "$current_config_file" ]; then
+            continue
+        fi
+
+        # 只自动处理本项目/旧版本脚本创建的配置，不碰用户自己的其它 Nginx 配置。
+        if ! is_managed_or_legacy_erp_config "$file"; then
+            continue
+        fi
+
+        # 旧版单文件 easy-reverse-proxy.conf 可能和新版多域名配置冲突，直接禁用。
+        if [ "$(basename "$file")" = "easy-reverse-proxy.conf" ]; then
+            disable_file_safely "$file"
+            continue
+        fi
+
+        # 引用了不存在的 SSL 证书时，禁用该坏配置，否则 nginx -t 会失败。
+        if has_missing_certificate_reference "$file"; then
+            disable_file_safely "$file"
+        fi
+    done
+
+    shopt -u nullglob
 }
 
 create_common_map_config() {
@@ -356,6 +443,8 @@ main() {
 
     install_dependencies
 
+    cleanup_legacy_easy_reverse_proxy_configs "$CONFIG_FILE"
+
     if [ -f "$CONFIG_FILE" ]; then
         cp "$CONFIG_FILE" "$BACKUP_FILE"
         success "已备份旧配置: $BACKUP_FILE"
@@ -366,7 +455,14 @@ main() {
     info "正在生成 Let's Encrypt 验证配置..."
     write_temp_nginx_config "$DOMAIN" "$CONFIG_FILE"
 
-    nginx -t
+    if ! nginx -t; then
+        echo "❌ 当前 Nginx 存在其它错误配置，无法继续。"
+        echo "请运行下面命令定位错误文件："
+        echo "nginx -t"
+        echo "grep -R \"ssl_certificate\" /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null"
+        exit 1
+    fi
+
     systemctl reload nginx
 
     if ! request_certificate "$DOMAIN" "$EMAIL"; then
