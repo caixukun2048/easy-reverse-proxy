@@ -64,53 +64,134 @@ validate_domain() {
     local domain="$1"
 
     if [ -z "$domain" ]; then
-        error_exit "域名不能为空！"
+        echo "❌ 域名不能为空！"
+        return 1
     fi
 
     if [ "${#domain}" -gt 253 ]; then
-        error_exit "域名长度不能超过 253 个字符！"
+        echo "❌ 域名长度不能超过 253 个字符！"
+        return 1
     fi
 
     if ! [[ "$domain" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9-]{2,63}$ ]]; then
-        error_exit "域名格式不合法！请输入类似 example.com 的完整域名。"
+        echo "❌ 域名格式不合法！请输入类似 example.com 的完整域名。"
+        return 1
     fi
+
+    return 0
 }
 
 validate_target_host() {
     local target_host="$1"
 
     if [ -z "$target_host" ]; then
-        error_exit "目标源站 IP 不能为空！"
+        echo "❌ 目标源站 IP 不能为空！"
+        return 1
     fi
 
     # 允许 IPv4、IPv6、内网主机名、普通域名；禁止空格、分号、括号等可能破坏 Nginx 配置的字符。
     if ! [[ "$target_host" =~ ^[A-Za-z0-9._:-]+$ ]]; then
-        error_exit "目标源站 IP / 主机格式不合法！"
+        echo "❌ 目标源站 IP / 主机格式不合法！"
+        return 1
     fi
+
+    return 0
 }
 
 validate_port() {
     local port="$1"
 
     if [ -z "$port" ]; then
-        error_exit "目标端口不能为空！"
+        echo "❌ 目标端口不能为空！"
+        return 1
     fi
 
     if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-        error_exit "端口必须是 1-65535 的数字！"
+        echo "❌ 端口必须是 1-65535 的数字！"
+        return 1
     fi
+
+    return 0
 }
 
 validate_email() {
     local email="$1"
 
+    # 邮箱可留空。留空时 Certbot 使用 --register-unsafely-without-email。
     if [ -z "$email" ]; then
-        error_exit "邮箱不能为空！"
+        return 0
     fi
 
     if ! [[ "$email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
-        error_exit "邮箱格式不合法！"
+        echo "❌ 邮箱格式不合法。请重新输入，或直接回车跳过。"
+        return 1
     fi
+
+    return 0
+}
+
+prompt_for_domain() {
+    local value
+
+    while true; do
+        read -r -p "1. 请输入你的反代域名: " value
+        value="$(normalize_domain "$value")"
+
+        if validate_domain "$value"; then
+            printf '%s' "$value"
+            return 0
+        fi
+
+        echo "请重新输入。"
+    done
+}
+
+prompt_for_target_host() {
+    local value
+
+    while true; do
+        read -r -p "2. 请输入目标源站 IP: " value
+        value="$(trim "$value")"
+
+        if validate_target_host "$value"; then
+            printf '%s' "$value"
+            return 0
+        fi
+
+        echo "请重新输入。"
+    done
+}
+
+prompt_for_target_port() {
+    local value
+
+    while true; do
+        read -r -p "3. 请输入目标源站端口: " value
+        value="$(trim "$value")"
+
+        if validate_port "$value"; then
+            printf '%s' "$value"
+            return 0
+        fi
+
+        echo "请重新输入。"
+    done
+}
+
+prompt_for_email() {
+    local value
+
+    while true; do
+        read -r -p "4. 请输入你的电子邮箱，可直接回车跳过: " value
+        value="$(trim "$value")"
+
+        if validate_email "$value"; then
+            printf '%s' "$value"
+            return 0
+        fi
+
+        echo "请重新输入。"
+    done
 }
 
 format_target_host_for_url() {
@@ -130,7 +211,7 @@ detect_target_scheme() {
     local https_code
     local http_code
 
-    info "正在自动探测源站协议..."
+    info "正在自动探测源站协议..." >&2
 
     https_code="$(curl -k -s -o /dev/null -w "%{http_code}" --connect-timeout 4 --max-time 8 "https://${host_for_url}:${port}/" || true)"
     http_code="$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 4 --max-time 8 "http://${host_for_url}:${port}/" || true)"
@@ -288,20 +369,33 @@ request_certificate() {
 
     info "正在申请 SSL 证书..."
 
-    certbot certonly \
-        --webroot \
-        -w "$WEBROOT" \
-        -d "$domain" \
-        --non-interactive \
-        --agree-tos \
-        --keep-until-expiring \
-        -m "$email"
+    if [ -n "$email" ]; then
+        certbot certonly \
+            --webroot \
+            -w "$WEBROOT" \
+            -d "$domain" \
+            --non-interactive \
+            --agree-tos \
+            --keep-until-expiring \
+            -m "$email"
+    else
+        warn "未填写邮箱，将使用无邮箱模式申请证书。"
+        certbot certonly \
+            --webroot \
+            -w "$WEBROOT" \
+            -d "$domain" \
+            --non-interactive \
+            --agree-tos \
+            --register-unsafely-without-email \
+            --keep-until-expiring
+    fi
 }
 
 write_final_nginx_config() {
     local domain="$1"
     local target_url="$2"
-    local config_file="$3"
+    local target_host_header="$3"
+    local config_file="$4"
 
     local ssl_options_line=""
     local ssl_dhparam_line=""
@@ -351,8 +445,9 @@ ${ssl_dhparam_line}
 
         proxy_http_version 1.1;
 
-        # Forward original visitor and public HTTPS information to upstream.
-        proxy_set_header Host \$host;
+        # Use the original upstream Host for maximum compatibility with arbitrary IP:port websites.
+        # Public domain information is still passed through X-Forwarded-* headers.
+        proxy_set_header Host ${target_host_header};
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;
@@ -412,24 +507,15 @@ main() {
     require_supported_os
     print_banner
 
-    read -r -p "1. 请输入你的反代域名: " DOMAIN_INPUT
-    read -r -p "2. 请输入目标源站 IP: " TARGET_HOST_INPUT
-    read -r -p "3. 请输入目标源站端口: " TARGET_PORT_INPUT
-    read -r -p "4. 请输入你的电子邮箱: " EMAIL_INPUT
-
-    DOMAIN="$(normalize_domain "$DOMAIN_INPUT")"
-    TARGET_HOST="$(trim "$TARGET_HOST_INPUT")"
-    TARGET_PORT="$(trim "$TARGET_PORT_INPUT")"
-    EMAIL="$(trim "$EMAIL_INPUT")"
-
-    validate_domain "$DOMAIN"
-    validate_target_host "$TARGET_HOST"
-    validate_port "$TARGET_PORT"
-    validate_email "$EMAIL"
+    DOMAIN="$(prompt_for_domain)"
+    TARGET_HOST="$(prompt_for_target_host)"
+    TARGET_PORT="$(prompt_for_target_port)"
+    EMAIL="$(prompt_for_email)"
 
     TARGET_HOST_FOR_URL="$(format_target_host_for_url "$TARGET_HOST")"
     TARGET_SCHEME="$(detect_target_scheme "$TARGET_HOST_FOR_URL" "$TARGET_PORT")"
     TARGET_URL="${TARGET_SCHEME}://${TARGET_HOST_FOR_URL}:${TARGET_PORT}"
+    TARGET_HOST_HEADER="${TARGET_HOST_FOR_URL}:${TARGET_PORT}"
 
     CONFIG_FILE="/etc/nginx/conf.d/easy-reverse-proxy-${DOMAIN}.conf"
     BACKUP_FILE="${CONFIG_FILE}.bak.$(date +%s)"
@@ -483,7 +569,7 @@ main() {
     fi
 
     info "正在生成最终反向代理配置..."
-    write_final_nginx_config "$DOMAIN" "$TARGET_URL" "$CONFIG_FILE"
+    write_final_nginx_config "$DOMAIN" "$TARGET_URL" "$TARGET_HOST_HEADER" "$CONFIG_FILE"
 
     info "正在检查 Nginx 配置..."
     if nginx -t; then

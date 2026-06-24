@@ -7,7 +7,7 @@
 1. 反代域名
 2. 目标源站 IP
 3. 目标源站端口
-4. 邮箱
+4. 邮箱，可留空
 
 脚本会自动完成：
 
@@ -47,14 +47,32 @@ sudo ./install.sh
 1. 请输入你的反代域名: proxy.example.com
 2. 请输入目标源站 IP: 1.2.3.4
 3. 请输入目标源站端口: 8080
-4. 请输入你的电子邮箱: admin@example.com
+4. 请输入你的电子邮箱，可直接回车跳过: admin@example.com
 ```
+
+邮箱可以直接回车跳过。
 
 完成后访问：
 
 ```text
 https://proxy.example.com
 ```
+
+---
+
+## 邮箱是否必须
+
+邮箱不是反向代理本身必须的。
+
+Let's Encrypt / Certbot 推荐填写邮箱，用于接收证书过期、账户安全等通知。
+
+如果不想填写，可以在脚本提示邮箱时直接回车跳过。留空时脚本会使用：
+
+```text
+--register-unsafely-without-email
+```
+
+继续申请证书。
 
 ---
 
@@ -121,7 +139,7 @@ https://proxy.example.com
 反代域名：proxy.example.com
 目标源站 IP：1.2.3.4
 目标源站端口：8080
-邮箱：admin@example.com
+邮箱：admin@example.com，或直接回车跳过
 ```
 
 最终效果：
@@ -328,18 +346,33 @@ sudo systemctl reload nginx
 
 ---
 
-## 防火墙放行示例
+## 版本 v1.0.2 修复说明
 
-如果使用 UFW：
+如果旧版本出现类似：
 
-```bash
-sudo ufw allow 80/tcp
-sudo ufw allow 443/tcp
-sudo ufw reload
+```text
+unknown directive "http://源站IP:端口"
 ```
+
+请更新到 v1.0.2 或更高版本。该问题是旧版脚本在自动探测源站协议时，将提示文字错误写入了 Nginx 配置。
+
 
 ---
 
-## License
+## 版本 v1.0.4 修复说明
 
-MIT License
+v1.0.4 将默认上游请求头改为：
+
+```nginx
+proxy_set_header Host 源站IP:源站端口;
+```
+
+原因：本项目的核心场景是“反代任意 IP+端口网站”。很多源站页面、前端接口、登录逻辑会依赖原始 `Host`。如果默认发送公网反代域名，页面可能出现空白、接口失败、登录异常等问题。
+
+公网域名仍然会通过这些头传给源站：
+
+```nginx
+X-Forwarded-Host
+X-Forwarded-Proto
+X-Forwarded-Port
+```
